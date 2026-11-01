@@ -1,0 +1,79 @@
+name: collect-supply
+
+# 오늘전력수급현황 API는 '오늘' 하루치만 준다. 하루가 끝나기 전에 받아서 파일에 쌓아 둔다.
+# GitHub 스케줄은 몇 시간씩 늦어지거나 건너뛰기도 해서, 하루 끝에 한두 번만 돌리면 자정을 넘길 때 그날을 통째로 놓친다.
+# 그래서 매시 23분에 자주 돌려 조금씩 쌓고, 23:55 KST 에 하루 마감용으로 한 번 더 돌린다.
+# (같은 시각은 덮어쓰므로 여러 번 돌려도 중복되지 않는다. 바뀐 게 없으면 커밋도 없다.)
+# 수집이 끝나면 같은 워크플로가 site/ 를 GitHub Pages 에 배포한다.
+# 저장소 Settings → Pages → Source 를 "GitHub Actions" 로 해 두어야 한다.
+# 대시보드(site/index.html)를 고쳤을 때는 Run workflow 에서 collect 를 끄고 배포만 한다.
+on:
+  schedule:
+    - cron: "23 * * * *"    # 매시 23분 (정각 혼잡 회피)
+    - cron: "55 14 * * *"   # 14:55 UTC = 23:55 KST, 하루 마감용
+  workflow_dispatch:         # Actions 탭의 Run workflow 버튼
+    inputs:
+      collect:
+        description: "API에서 새로 받아 쌓기 (끄면 지금 저장소의 site/ 를 배포만 합니다)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 오늘 전력수급 받아서 쌓기
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.collect }}
+        env:
+          KPX_API_KEY: ${{ secrets.KPX_API_KEY }}   # 저장소 Settings → Secrets 에 등록한 인증키
+        run: python scripts/fetch_today.py
+
+      - name: 바뀐 데이터가 있으면 커밋
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add site/data
+          if git diff --cached --quiet; then
+            echo "변경 없음 - 커밋하지 않습니다."
+            exit 0
+          fi
+          git commit -m "data: 전력수급 5분 데이터 갱신"
+          git pull --rebase
+          git push
+
+      # 방금 쌓은 데이터까지 포함한 site/ 폴더를 배포용 꾸러미로 묶는다.
+      # (기본 토큰으로 한 커밋은 다른 워크플로를 깨우지 않으므로, 수집 → 커밋 → 배포를 이 워크플로 안에서 잇는다)
+      - name: site/ 를 배포용으로 묶기
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: update
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write       # GitHub Pages 에 배포할 권한
+      id-token: write    # 배포가 이 저장소에서 온 것임을 증명하는 데 필요
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: GitHub Pages 에 배포
+        id: deployment
+        uses: actions/deploy-pages@v5
